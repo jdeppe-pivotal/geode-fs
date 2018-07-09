@@ -25,8 +25,7 @@ var _ = Describe("Sanity", func() {
 			log.Print(msg)
 		}
 
-		var err error
-		tempMountPoint, err = ioutil.TempDir("", "gfs")
+		tempMountPoint, err := ioutil.TempDir("", "gfs")
 		if err != nil {
 			panic(err)
 		}
@@ -68,14 +67,61 @@ var _ = Describe("Sanity", func() {
 
 	Context("when creating a single file", func() {
 		It("it can be read back", func() {
-			content := "foo"
-			file := path.Join(tempMountPoint, "foo")
-			err := ioutil.WriteFile(file, []byte(content), os.ModePerm)
+			contentAndName := "test1"
+			file := path.Join(tempMountPoint, contentAndName)
+			err := ioutil.WriteFile(file, []byte(contentAndName), os.ModePerm)
 			Expect(err).To(BeNil())
 
 			result, err := ioutil.ReadFile(file)
 			Expect(err).To(BeNil())
+			Expect(string(result)).To(Equal(contentAndName))
+		})
+
+		It("it can be updated after initial creation", func() {
+			contentAndName := "test2"
+			file := path.Join(tempMountPoint, contentAndName)
+			err := ioutil.WriteFile(file, []byte(contentAndName), os.ModePerm)
+			Expect(err).To(BeNil())
+
+			result, err := ioutil.ReadFile(file)
+			Expect(err).To(BeNil())
+			Expect(string(result)).To(Equal(contentAndName))
+
+			content := "test2 updated"
+			err = ioutil.WriteFile(file, []byte(content), os.ModePerm)
+			Expect(err).To(BeNil())
+
+			result, err = ioutil.ReadFile(file)
+			Expect(err).To(BeNil())
 			Expect(string(result)).To(Equal(content))
+		})
+
+		It("it has the correct size", func() {
+			contentAndName := "test3"
+			file := path.Join(tempMountPoint, contentAndName)
+
+			f, err := os.Create(file)
+			Expect(err).To(BeNil())
+			f.Close()
+
+			fileInfo, err := os.Stat(contentAndName)
+			Expect(err).To(BeNil())
+
+			Expect(fileInfo.Size()).To(BeEquivalentTo(0))
+
+			err = ioutil.WriteFile(file, []byte(contentAndName), os.ModePerm)
+
+			fileInfo, err = os.Stat(contentAndName)
+			Expect(err).To(BeNil())
+			Expect(fileInfo.Size()).To(BeEquivalentTo(len(contentAndName)))
+
+			updatedContent := "test2 updated"
+			err = ioutil.WriteFile(file, []byte(updatedContent), os.ModePerm)
+			Expect(err).To(BeNil())
+
+			fileInfo, err = os.Stat(contentAndName)
+			Expect(err).To(BeNil())
+			Expect(fileInfo.Size()).To(BeEquivalentTo(len(updatedContent)))
 		})
 	})
 })
