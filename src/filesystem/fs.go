@@ -8,13 +8,15 @@ import (
 	"golang.org/x/net/context"
 	"github.com/gemfire/geode-go-client/connector"
 	geode "github.com/gemfire/geode-go-client"
-	"net"
-	"sync"
+		"sync"
+	"path"
+	"strconv"
+	"github.com/gemfire/geode-go-client/query"
+	"strings"
 )
 
 const METADATA_REGION = "metadata"
 const BLOCKS_REGION = "blocks"
-
 
 type GFS struct {
 	Client   *geode.Client
@@ -22,15 +24,13 @@ type GFS struct {
 	handleId uint64
 }
 
-func NewGfs(serverPort string) *GFS {
-	c, err := net.Dial("tcp", serverPort)
-	if err != nil {
-		panic(err)
-	}
+func NewGfs(serverAndPort string) *GFS {
+	parts := strings.Split(serverAndPort, ":")
+	port, _ := strconv.Atoi(parts[1])
 
-	p := connector.NewPool(c)
+	p := connector.NewPool()
+	p.AddServer(parts[0], port)
 	conn := connector.NewConnector(p)
-	conn.Handshake()
 	client := geode.NewGeodeClient(conn)
 
 	return &GFS{Client: client}
@@ -47,16 +47,20 @@ func (g *GFS) getNewHandleId() fuse.HandleID {
 var _ fs.FS = (*GFS)(nil)
 
 func (g *GFS) Root() (fs.Node, error) {
+	i := &INode{
+		Name: "/",
+	}
+
 	n := &Dir{
-		gfs: g,
-		name:   "/",
+		gfs:  g,
+		inode: i,
 	}
 	return n, nil
 }
 
 type Dir struct {
-	gfs    *GFS
-	name   string
+	gfs   *GFS
+	inode *INode
 }
 
 var _ fs.Node = (*Dir)(nil)
@@ -66,14 +70,15 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-var _ = fs.NodeRequestLookuper(&Dir{})
+var _ fs.NodeStringLookuper = (*Dir)(nil)
 
-func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
+func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	v := &INode{}
-	fuse.Debug(fmt.Sprintf("--->>> req: %+v", req))
-	ok, err := d.gfs.Client.Get(METADATA_REGION, req.Name, v)
-	fuse.Debug(fmt.Sprintf("--->>> get ok: %+v", ok))
-	fuse.Debug(fmt.Sprintf("--->>> get name: %+v", req.Name))
+	fullPath := path.Join(d.inode.Parent, d.inode.Name, name)
+	ok, err := d.gfs.Client.Get(METADATA_REGION, fullPath, v)
+	fuse.Debug(fmt.Sprintf("--->>> get ok: %+v fullPath: %s", ok, fullPath))
+	fuse.Debug(fmt.Sprintf("--->>> get name: %+v", name))
+	fuse.Debug(fmt.Sprintf("--->>> get parent: %+v", d.inode.Name))
 	fuse.Debug(fmt.Sprintf("--->>> get value: %+v", v))
 	fuse.Debug(fmt.Sprintf("--->>> get err: %v", err))
 	if err != nil {
@@ -84,22 +89,27 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		return nil, fuse.ENOENT
 	}
 
-	file := &File{
-		inode: v,
-		gfs: d.gfs,
+	var node fs.Node
+	if (v.IsDirectory) {
+		node = &Dir{
+			inode: v,
+			gfs:   d.gfs,
+		}
+	} else {
+		node = &File{
+			inode: v,
+			gfs:   d.gfs,
+		}
 	}
 
-	resp.Attr.Size = v.Size
-	resp.Attr.Mode = v.Mode
-
-	return file, nil
+	return node, nil
 }
 
 var _ fs.HandleReadDirAller = (*Dir)(nil)
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	fuse.Debug("---->>>> calling Dir.ReadDirAll")
-	q := d.gfs.Client.Query(fmt.Sprintf("select * from /metadata where parent = '%s'", d.name))
+	q := query.NewQuery(fmt.Sprintf("select * from /metadata where parent = '%s'", path.Join(d.inode.Parent, d.inode.Name)))
 	q.Reference = &INode{}
 
 	inodes, err := d.gfs.Client.QueryForListResult(q)
@@ -116,8 +126,34 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		}
 		dirents = append(dirents, d)
 	}
+	fuse.Debug(fmt.Sprintf("---->>>> Dir.ReadDirAll returning %d entries\n", len(dirents)))
 
 	return dirents, nil
+}
+
+var _ fs.NodeMkdirer = (*Dir)(nil)
+
+func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+	v := &INode{
+		Name:        req.Name,
+		Parent:      path.Join(d.inode.Parent, d.inode.Name),
+		Mode:        req.Mode,
+		Id:          uint64(d.gfs.getNewHandleId()),
+		IsDirectory: true,
+	}
+	fullPath := path.Join(d.inode.Parent, d.inode.Name, req.Name)
+	err := d.gfs.Client.Put(METADATA_REGION, fullPath, v)
+	if err != nil {
+		return nil, err
+	}
+
+	node := &Dir{
+		gfs:   d.gfs,
+		inode: v,
+	}
+
+	fuse.Debug(fmt.Sprintf("--->>> Created dir %+v node:%+v", node.inode, node))
+	return node, nil
 }
 
 //var _ = fs.HandleReadDirAller(&Dir{})
@@ -128,8 +164,8 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 //}
 
 type File struct {
-	inode  *INode
-	gfs *GFS
+	inode *INode
+	gfs   *GFS
 }
 
 var _ fs.Node = (*File)(nil)
@@ -138,30 +174,48 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	//zipAttr(f.file, a)
 	a.Size = f.inode.Size
 	a.Mode = f.inode.Mode
+	a.Inode = f.inode.Id
 
 	return nil
 }
 
-var _ = fs.NodeCreater(&Dir{})
+var _ fs.NodeCreater = (*Dir)(nil)
 
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+	return createNode(ctx, req, resp, d.gfs, path.Join(d.inode.Parent, d.inode.Name))
+}
+
+//var _ fs.NodeCreater = (*File)(nil)
+//
+//func (f *File) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+//	return createNode(ctx, req, resp, f.gfs, f.inode.Name)
+//}
+
+func createNode(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse, gfs *GFS, parent string) (fs.Node, fs.Handle, error) {
+	resp.Handle = gfs.getNewHandleId()
+
 	v := &INode{
-		Name: req.Name,
-		Parent: d.name,
-		Mode: req.Mode,
+		Name:   req.Name,
+		Parent: parent,
+		Mode:   req.Mode,
+		Id:     uint64(resp.Handle),
 	}
-	err := d.gfs.Client.Put(METADATA_REGION, req.Name, v)
+	fullPath := path.Join(parent, req.Name)
+	err := gfs.Client.Put(METADATA_REGION, fullPath, v)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	node := &File{inode: v}
+	node := &File{
+		inode: v,
+		gfs:   gfs,
+	}
 	handle := &FileHandle{
 		inode: v,
-		gfs: d.gfs,
+		gfs:   gfs,
 	}
 
-	resp.Handle = d.gfs.getNewHandleId()
+	fuse.Debug(fmt.Sprintf("--->>> Created inode %+v node:%+v", node.inode, node))
 
 	return node, handle, nil
 }
@@ -169,36 +223,63 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 var _ = fs.NodeOpener(&File{})
 
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
-	//r, err := f.file.Open()
-	//if err != nil {
-	//	return nil, err
-	//}
-	//individual entries inside a zip file are not seekable
-	//resp.Flags |= fuse.OpenNonSeekable
-
 	handle := &FileHandle{
 		inode: f.inode,
-		gfs: f.gfs,
+		gfs:   f.gfs,
 	}
 
 	resp.Flags |= fuse.OpenNonSeekable
 	resp.Handle = f.gfs.getNewHandleId()
 
-	fuse.Debug(fmt.Sprintf("--->>> Open: %s %+v", f.inode.Name, handle))
+	fuse.Debug(fmt.Sprintf("--->>> Open: %+v", f.inode))
 
 	return handle, nil
 }
 
-var _ = fs.NodeRemover(&Dir{})
+var _ fs.NodeGetattrer = (*File)(nil)
+
+func (f *File) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fuse.GetattrResponse) error {
+	resp.Attr.Inode = f.inode.Id
+	resp.Attr.Size = f.inode.Size
+	resp.Attr.Mode = f.inode.Mode
+	fuse.Debug(fmt.Sprintf("--->>> Getattr: %+v f:%+v", f.inode, f))
+
+	return nil
+}
+
+var _ fs.NodeSetattrer = (*File)(nil)
+
+func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	if req.Valid.Mode() {
+		f.inode.Mode = req.Mode
+	}
+
+	if req.Valid.Size() {
+		f.inode.Size = req.Size
+	}
+
+	fullPath := path.Join(f.inode.Parent, f.inode.Name)
+	err := f.gfs.Client.Put(METADATA_REGION, fullPath, f.inode)
+	if err != nil {
+		return err
+	}
+
+	fuse.Debug(fmt.Sprintf("--->>> Setattr: %+v f:%+v", f.inode, f))
+
+	return nil
+}
+
+var _ fs.NodeRemover = (*Dir)(nil)
 
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
-	return d.gfs.Client.Remove(METADATA_REGION, req.Name)
+	fullPath := path.Join(d.inode.Parent, d.inode.Name)
+	return d.gfs.Client.Remove(METADATA_REGION, fullPath)
 }
 
 type FileHandle struct {
 	//r     io.ReadCloser
 	inode *INode
-	gfs *GFS
+	gfs   *GFS
 }
 
 var _ fs.Handle = (*FileHandle)(nil)
@@ -213,7 +294,8 @@ var _ fs.HandleReadAller = (*FileHandle)(nil)
 
 func (fh *FileHandle) ReadAll(ctx context.Context) ([]byte, error) {
 	fuse.Debug("--->>> ReadAll")
-	rawData, err := fh.gfs.Client.Get(BLOCKS_REGION, fh.inode.Name)
+	fullPath := path.Join(fh.inode.Parent, fh.inode.Name)
+	rawData, err := fh.gfs.Client.Get(BLOCKS_REGION, fullPath)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +308,8 @@ func (fh *FileHandle) ReadAll(ctx context.Context) ([]byte, error) {
 var _ fs.HandleReader = (*FileHandle)(nil)
 
 func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	rawData, err := fh.gfs.Client.Get(BLOCKS_REGION, fh.inode.Name)
+	fullPath := path.Join(fh.inode.Parent, fh.inode.Name)
+	rawData, err := fh.gfs.Client.Get(BLOCKS_REGION, fullPath)
 	if err != nil {
 		return err
 	}
@@ -240,12 +323,13 @@ func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 var _ fs.HandleWriter = (*FileHandle)(nil)
 
 func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	fuse.Debug(fmt.Sprintf("--->>> writing to %s", fh.inode.Name))
-	err := fh.gfs.Client.Put(BLOCKS_REGION, fh.inode.Name, req.Data)
+	fuse.Debug(fmt.Sprintf("--->>> writing to %s fh:%+v", fh.inode.Name, fh))
+	fullPath := path.Join(fh.inode.Parent, fh.inode.Name)
+	err := fh.gfs.Client.Put(BLOCKS_REGION, fullPath, req.Data)
 	resp.Size = len(req.Data)
 
 	inode := &INode{}
-	ok, err := fh.gfs.Client.Get(METADATA_REGION, fh.inode.Name, inode)
+	ok, err := fh.gfs.Client.Get(METADATA_REGION, fullPath, inode)
 	if err != nil {
 		fuse.Debug("Error from get")
 		return err
@@ -256,10 +340,11 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 
 	inode.Size = uint64(len(req.Data))
 
-	err = fh.gfs.Client.Put(METADATA_REGION, fh.inode.Name, inode)
+	err = fh.gfs.Client.Put(METADATA_REGION, fullPath, inode)
 	if err != nil {
 		fuse.Debug("Error from put")
 	}
+	*fh.inode = *inode
 
 	return err
 }
@@ -268,7 +353,7 @@ var _ fs.HandleReadDirAller = (*FileHandle)(nil)
 
 func (fh *FileHandle) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	fuse.Debug("---->>>> calling FileHandle.ReadDirAll")
-	q := fh.gfs.Client.Query(fmt.Sprintf("select * from /metadata where parent = '%s'", fh.inode.Parent))
+	q := query.NewQuery(fmt.Sprintf("select * from /metadata where parent = '%s'", fh.inode.Parent))
 	q.Reference = &INode{}
 
 	inodes, err := fh.gfs.Client.QueryForListResult(q)

@@ -9,6 +9,9 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"filesystem"
+	_ "net/http/pprof"
+	_ "net/http"
+	"net/http"
 )
 
 var progName = filepath.Base(os.Args[0])
@@ -20,6 +23,10 @@ func usage() {
 }
 
 func main() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	log.SetFlags(0)
 	log.SetPrefix(progName + ": ")
 
@@ -30,21 +37,21 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	path := flag.Arg(0)
+	serverAndPort := flag.Arg(0)
 	mountpoint := flag.Arg(1)
-	if err := mount(path, mountpoint); err != nil {
+	if err := mount(serverAndPort, mountpoint); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func mount(serverPort, mountpoint string) error {
+func mount(serverAndPort, mountpoint string) error {
 	c, err := fuse.Mount(mountpoint, fuse.NoAppleDouble(), fuse.NoAppleXattr())
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
-	filesys := filesystem.NewGfs(serverPort)
+	filesys := filesystem.NewGfs(serverAndPort)
 	if err := fs.Serve(c, filesys); err != nil {
 		return err
 	}
